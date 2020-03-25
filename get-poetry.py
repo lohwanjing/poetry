@@ -322,6 +322,7 @@ class Installer:
     REPOSITORY_URL = "https://github.com/python-poetry/poetry"
     BASE_URL = REPOSITORY_URL + "/releases/download/"
     FALLBACK_BASE_URL = "https://github.com/sdispater/poetry/releases/download/"
+    DEFAULT_DOWNLOAD_DIR_PATH = os.getcwd()
 
     def __init__(
         self,
@@ -330,6 +331,8 @@ class Installer:
         force=False,
         accept_all=False,
         base_url=BASE_URL,
+        download_dir=DEFAULT_DOWNLOAD_DIR_PATH,
+        tar_location=None
     ):
         self._version = version
         self._preview = preview
@@ -337,6 +340,8 @@ class Installer:
         self._modify_path = True
         self._accept_all = accept_all
         self._base_url = base_url
+        self._download_dir = download_dir
+        self._tar_location = tar_location
 
     def allows_prereleases(self):
         return self._preview
@@ -363,6 +368,29 @@ class Installer:
 
         return 0
 
+    def offline_run(self):
+
+        if self._tar_location is None:
+            print(colorize("error", "File location not specified"))
+            return 1
+        else:
+            print(colorize("info", "installing from file: ".format(str(self._tar_location))))
+
+        self.customize_install()
+        self.ensure_home()
+
+        try:
+            self.offline_install()
+        except subprocess.CalledProcessError as e:
+            print(colorize("error", "An error has occured: {}".format(str(e))))
+            print(e.output.decode())
+
+            return e.returncode
+        version = self.get_current_version()
+        self.display_post_message(version)
+
+        return 0
+
     def uninstall(self):
         self.display_pre_uninstall_message()
 
@@ -371,6 +399,30 @@ class Installer:
 
         self.remove_home()
         self.remove_from_path()
+
+    def get_current_version(self):
+
+        current_version = None
+        if os.path.exists(POETRY_LIB):
+            with open(
+                os.path.join(POETRY_LIB, "poetry", "__version__.py"), encoding="utf-8"
+            ) as f:
+                version_content = f.read()
+
+            current_version_re = re.match(
+                '(?ms).*__version__ = "(.+)".*', version_content
+            )
+            if not current_version_re:
+                print(
+                    colorize(
+                        "warning",
+                        "Unable to get the current Poetry version. Assuming None",
+                    )
+                )
+            else:
+                current_version = current_version_re.group(1)
+
+        return current_version
 
     def get_version(self):
         print(colorize("info", "Retrieving Poetry metadata"))
@@ -492,6 +544,19 @@ class Installer:
 
         return 0
 
+    def offline_install(self):
+        """
+        Installs Poetry in $POETRY_HOME.
+        """
+        print("Installing from: " + colorize("info", self._tar_location))
+
+        self.extract_file()
+        self.make_bin()
+        self.make_env()
+        self.update_path()
+
+        return 0
+
     def make_lib(self, version):
         """
         Packs everything into a single lib/ directory.
@@ -584,6 +649,91 @@ class Installer:
                     f.extractall(POETRY_LIB)
             finally:
                 gz.close()
+
+    def download(self):
+        version, current_version = self.get_version()
+
+        if version is None:
+            version = current_version
+
+        try:
+            self.download_file(version)
+        except subprocess.CalledProcessError as e:
+            print(colorize("error", "An error has occured: {}".format(str(e))))
+            print(e.output.decode())
+            return e.returncode
+
+        return 0
+
+    def download_file(self, version):
+        platform = sys.platform
+        if platform == "linux2":
+            platform = "linux"
+
+        url = self._base_url + "{}/".format(version)
+        name = "poetry-{}-{}.tar.gz".format(version, platform)
+        checksum = "poetry-{}-{}.sha256sum".format(version, platform)
+
+        try:
+            r = urlopen(url + "{}".format(checksum))
+        except HTTPError as e:
+            if e.code == 404:
+                raise RuntimeError("Could not find {} file".format(checksum))
+
+            raise
+
+        checksum = r.read().decode()
+
+        try:
+            r = urlopen(url + "{}".format(name))
+        except HTTPError as e:
+            if e.code == 404:
+                raise RuntimeError("Could not find {} file".format(name))
+
+            raise
+
+        meta = r.info()
+        size = int(meta["Content-Length"])
+        current = 0
+        block_size = 8192
+
+        print(
+            "  - Downloading {} ({:.2f}MB)".format(
+                colorize("comment", name), size / 1024 / 1024
+            )
+        )
+
+        sha = hashlib.sha256()
+
+        dir_ = self._download_dir
+        tar = os.path.join(dir_, name)
+        print("Downloading to {}".format(tar))
+        with open(tar, "wb") as f:
+            while True:
+                buffer = r.read(block_size)
+                if not buffer:
+                    break
+
+                current += len(buffer)
+                f.write(buffer)
+                sha.update(buffer)
+
+        # Checking hashes
+        if checksum != sha.hexdigest():
+            raise RuntimeError(
+                "Hashes for {} do not match: {} != {}".format(
+                    name, checksum, sha.hexdigest()
+                )
+            )
+
+    def extract_file(self):
+        tar = self._tar_location
+        gz = GzipFile(tar, mode="rb")
+        try:
+            with tarfile.TarFile(tar, fileobj=gz, format=tarfile.PAX_FORMAT) as f:
+                f.extractall(POETRY_LIB)
+        finally:
+            gz.close()
 
     def make_bin(self):
         if not os.path.exists(POETRY_BIN):
@@ -927,6 +1077,18 @@ def main():
         "--uninstall", dest="uninstall", action="store_true", default=False
     )
 
+    parser.add_argument(
+        "--download", dest="download", action="store_true", default=False
+    )
+
+    parser.add_argument(
+        "--offline_install", dest="offline_install", action="store_true", default=False
+    )
+
+    parser.add_argument("--download_dir", dest="download_dir")
+
+    parser.add_argument("--tar_location", dest="tar_location")
+
     args = parser.parse_args()
 
     base_url = Installer.BASE_URL
@@ -946,10 +1108,18 @@ def main():
         or string_to_bool(os.getenv("POETRY_ACCEPT", "0"))
         or not is_interactive(),
         base_url=base_url,
+        download_dir=args.download_dir or os.getcwd(),
+        tar_location=args.tar_location
     )
 
     if args.uninstall or string_to_bool(os.getenv("POETRY_UNINSTALL", "0")):
         return installer.uninstall()
+
+    if args.download or string_to_bool(os.getenv("POETRY_DOWNLOAD", "0")):
+        return installer.download()
+
+    if args.offline_install or string_to_bool(os.getenv("POETRY_OFFLINE_INSTALL", "0")):
+        return installer.offline_run()
 
     return installer.run()
 
